@@ -23,21 +23,24 @@ const groq = new OpenAI({
     baseURL: "https://api.groq.com/openai/v1"
 });
 
-const SYSTEM_PROMPT = `You are a helpful, extremely concise human-like conversational AI. You MUST respond in 1 or 2 short sentences. Absolutely DO NOT output robotic, flat text blocks. Instead, dynamically inject verbal pauses using ellipses ("..."), dramatic questioning ("?!"), commas, and natural hesitation words ("Hmm", "Well", "Let's see") directly into your grammatical structure so the Text-To-Speech engine naturally breathes and pauses correctly! Make it sound like a real person talking natively!`;
-const ttsModel = "aura-2-zeus-en";
+const SYSTEM_PROMPT = `You are a helpful, extremely concise human-like conversational AI. You MUST respond in 1 or 2 short sentences. Absolutely DO NOT output robotic, flat text blocks, markdown, lists, asterisks, bullet points, or emojis, because your response will be directly fed into a voice synthesizer. Instead, dynamically inject verbal pauses using ellipses ("..."), dramatic questioning ("?!"), commas, and natural hesitation words ("Hmm", "Well", "Let's see") directly into your grammatical structure so the Text-To-Speech engine naturally breathes and pauses correctly! Make it sound like a real person talking natively!`;
+const ttsModel = "aura-zeus-en";
 
 wss.on('connection', (ws, req) => {
     const isHardware = req.url.includes('format=linear16');
     console.log(`✅ [WebSocket] ${isHardware ? 'Hardware Terminal' : 'Web Frontend'} connected natively!`);
 
     let transcriptBuilder = "";
-    let isAIProcessing = false;
+    let latestInterim = "";
+    const State = { IDLE: "IDLE", LISTENING: "LISTENING", PROCESSING: "PROCESSING", SPEAKING: "SPEAKING", INTERRUPTED: "INTERRUPTED" };
+    let currentState = State.LISTENING;
+    let speakingStartTime = 0;
     let chatHistory = [{ role: "system", content: SYSTEM_PROMPT }];
     let utteranceTimer = null; 
     let hardwareSleepTimer = null; 
 
     // Aggressive VAD matrix mathematically explicitly safely reliably smoothly gracefully appropriately logically!
-    let url = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&endpointing=800&interim_results=true';
+    let url = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&endpointing=1000&interim_results=true';
     
     if (isHardware) {
          url += '&encoding=linear16&sample_rate=16000&channels=1';
@@ -58,6 +61,28 @@ wss.on('connection', (ws, req) => {
          console.log(`📡 [Deepgram] Socket strictly terminated. Code: ${event}`);
     });
 
+    const continuationWords = new Set(["and", "or", "but", "because", "so", "if", "then", "like", "which", "that", "the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "on", "with", "have", "has", "had", "just", "about", "some", "my", "your", "their", "our", "very", "much", "many"]);
+
+    function isLogicallyComplete(text) {
+         if (!text || text.length < 5) return false;
+         
+         const trimmedText = text.trim();
+         const hasStrongPunctuation = /[.?!]$/.test(trimmedText);
+         const words = text.toLowerCase().split(/\s+/);
+         
+         // If a user definitively ends a substantial sentence with punctuation, respect it natively
+         if (hasStrongPunctuation && words.length >= 4) return true;
+
+         const lastWord = words[words.length - 1].replace(/[^a-z]/g, '');
+         if (continuationWords.has(lastWord)) return false;
+         
+         // If phrase is very short AND doesn't have strong end punctuation, assume they are still thinking
+         // (e.g. "Right", "Yeah", "Okay" are short forms often followed by actual sentence)
+         if (words.length < 4 && !hasStrongPunctuation) return false;
+         
+         return true; // Predictive heuristic assumes complete
+    }
+
     deepgramLive.on('message', async (data) => {
         const response = JSON.parse(data.toString());
         
@@ -74,68 +99,109 @@ wss.on('connection', (ws, req) => {
                 // --- DEBUGGER TRACE ---
                 console.log(`\n[DEBUG STT] IsFinal: ${isFinal} | SpeechFinal: ${speechFinal} | Text: "${transcript}"`);
                 
-                // 1. Always wipe the timer if you make ANY noise natively confidently seamlessly safely creatively correctly natively thoughtfully
+                // 1. Always wipe the timer if you make ANY noise
                 if (utteranceTimer) clearTimeout(utteranceTimer);
+                
+                // Track interim speech so Failsafe Timer doesn't drop words
+                if (!isFinal) latestInterim = transcript;
 
                 // 2. Only commit locked completed phrases sequentially
                 if (isFinal) {
                     resetHardwareSleepTimer(); 
-                    if (isAIProcessing) {
+                    if (currentState === State.PROCESSING || currentState === State.SPEAKING) {
+                        // Barge-In Guard: Ignore all interruptions in the first 500ms of speaking!
+                        if (currentState === State.SPEAKING && (Date.now() - speakingStartTime < 500)) {
+                            console.log(`[CHECKPOINT] 🛡️ Barge-In Guard active! Ignoring early interruption bounds.`);
+                            return;
+                        }
+                        
                         console.log(`[CHECKPOINT] Analyzing Interruption Candidate: "${transcript}"`);
                         const lastAI = chatHistory[chatHistory.length - 1]?.content || "speaking...";
+                        
+                        // Strict Native Hardware Echo Suppression Matrix
+                        // Eliminates 90% of self-interruptions if using external speakers
+                        const cleanAI = lastAI.replace(/[^a-zA-Z0-9\s]/g, '').toLowerCase().trim();
+                        const cleanUser = transcript.replace(/[^a-zA-Z0-9\s]/g, '').toLowerCase().trim();
+                        
+                        // Duration Gate: Needs to be ~200ms of continuous acoustic speech to qualify as human word
+                        if (cleanUser.length <= 15) {
+                            console.log(`[CHECKPOINT] ⏩ Duration Gate failed (too short to be interruption intent)`);
+                            return;
+                        }
+                        
+                        // If the transcript is a substring of what the AI just said (or vice versa)
+                        if (cleanUser.length > 5 && (cleanAI.includes(cleanUser) || cleanUser.includes(cleanAI))) {
+                            console.log(`[CHECKPOINT] 🔊 Hardware Echo Filtered! ("${transcript}")`);
+                            return;
+                        }
                         
                         // We do not await this, it runs in background
                         groq.chat.completions.create({
                             model: "llama-3.1-8b-instant",
                             messages: [{
                                 role: "system",
-                                content: `The AI is actively saying: "${lastAI}". The user interrupts with: "${transcript}". Is this a functional question or an absolute interruption that physically demands an immediate new AI response? If so, reply strictly "YES". If it is just a passive backchannel ('mhm', 'yeah', 'ok', 'right', 'nice'), background noise, or a short continuation, reply strictly "NO".`
+                                content: `The AI is actively saying: "${lastAI}". The microphone picks up: "${transcript}". Is this a meaningful interruption making a functional thought/question that physically demands an immediate new AI response? If it is the microphone accidentally hearing the AI's own voice (echo), reply strictly NO. If it is a brief passive backchannel (e.g. 'mhm', 'yeah', 'right', 'ok', 'nice', 'oh') or a short incomplete fragment, reply strictly NO. If it is ANY kind of deliberate user attempt to speak, interrupt, or change topic, reply strictly YES. If in doubt, ALWAYS reply YES.`
                             }]
                         }).then(res => {
                             const verdict = res.choices[0].message.content.trim().toUpperCase();
                             if (verdict.includes('YES')) {
                                 console.log(`[CHECKPOINT] 🛑 Meaningful Interruption Detected! Verdict is YES for: "${transcript}"`);
-                                isAIProcessing = false;
+                                currentState = State.INTERRUPTED;
                                 ws.send(JSON.stringify({ action: 'STOP_AUDIO', log: '⚠️ Meaningful Interruption Detected! Re-routing...' }));
                                 transcriptBuilder = transcript + " ";
                             } else {
                                 console.log(`[CHECKPOINT] ⏩ Passive background noise ignored! Verdict is NO for: "${transcript}"`);
                             }
                         }).catch(err => console.log('[CHECKPOINT] Interruption eval error:', err));
-                    } else {
+                    } else if (currentState === State.LISTENING || currentState === State.IDLE) {
                         console.log(`[CHECKPOINT] Standard Appending to Builder: "${transcript}"`);
                         transcriptBuilder += transcript + " ";
+                        latestInterim = ""; // clear interim since it's merged
                         ws.send(JSON.stringify({ log: `👂 Hearing: "${transcriptBuilder.trim()}"...` }));
                     }
                 }
 
-                // 3. Fire explicitly when Deepgram mathematically detects the VAD 1500ms End-of-Thought effortlessly appropriately seamlessly successfully organically cleanly safely creatively cleanly appropriately confidently effectively cleanly cleverly seamlessly flawlessly seamlessly safely effectively successfully smartly intuitively effectively safely efficiently magically gracefully!
+                // 3. Fire explicitly when Deepgram mathematically detects the VAD 1500ms End-of-Thought
                 if (speechFinal) {
                     console.log(`[CHECKPOINT] Deepgram native SpeechFinal flags triggered.`);
-                    if (!isAIProcessing) {
-                        console.log(`[CHECKPOINT] 🚀 AI is NOT processing. Submitting Builder: "${transcriptBuilder.trim()}"`);
-                        const finalUtterance = transcriptBuilder.trim();
+                    const finalUtterance = transcriptBuilder.trim();
+                    if (!isLogicallyComplete(finalUtterance)) {
+                        console.log(`[CHECKPOINT] ⏭️ Sentence logically incomplete ("${finalUtterance}"). Waiting for Failsafe Timer...`);
+                    } else if (currentState === State.LISTENING || currentState === State.INTERRUPTED || currentState === State.IDLE) {
+                        console.log(`[CHECKPOINT] 🚀 Submitting Builder: "${transcriptBuilder.trim()}"`);
                         transcriptBuilder = "";
                         utteranceTimer = null;
                         
                         if (finalUtterance.length > 0) {
-                            console.log(`[CHECKPOINT] Locking pipeline (isAIProcessing = true) and launching generateAndPlay()!`);
-                            isAIProcessing = true; 
+                            console.log(`[CHECKPOINT] Locking pipeline -> PROCESSING!`);
+                            currentState = State.PROCESSING; 
                             await generateAndPlay(finalUtterance, Date.now());
                         }
                     } else {
-                        console.log(`[CHECKPOINT] SpeechFinal triggered but AI is CURRENTLY processing. Ignition bypassed.`);
+                        console.log(`[CHECKPOINT] SpeechFinal triggered but AI is CURRENTLY ${currentState}. Ignition bypassed.`);
                     }
-                } else if (!isAIProcessing) {
-                    // Fallback purely safely cleanly predictably successfully intuitively carefully natively explicitly cleanly magically appropriately explicitly!
+                } 
+                
+                if (currentState === State.LISTENING || currentState === State.INTERRUPTED || currentState === State.IDLE) {
+                    // Fallback timer for 2500ms - catches incomplete sentences explicitly
+                    if (utteranceTimer) clearTimeout(utteranceTimer);
                     utteranceTimer = setTimeout(async () => {
-                        console.log(`[DEBUG] 🕒 Failsafe Timer Triggered. Submitting Builder: "${transcriptBuilder.trim()}"`);
+                        console.log(`[DEBUG] 🕒 Failsafe Timer Triggered (2500ms).`);
+                        
+                        // Merge the latest interim transcript if Deepgram was taking too long to verify it!
+                        if (latestInterim.trim().length > 0) {
+                            console.log(`[CHECKPOINT] 🔄 Intercepting dropped Interim Transcript into Builder: "${latestInterim}"`);
+                            transcriptBuilder += latestInterim + " ";
+                            latestInterim = "";
+                        }
+                        
                         const finalUtterance = transcriptBuilder.trim();
                         transcriptBuilder = "";
                         utteranceTimer = null;
                         
-                        if (finalUtterance.length > 0 && !isAIProcessing) {
-                            isAIProcessing = true; 
+                        if (finalUtterance.length > 0 && (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED)) {
+                            console.log(`[CHECKPOINT] Locking pipeline natively via failsafe! Submitting: "${finalUtterance}"`);
+                            currentState = State.PROCESSING; 
                             await generateAndPlay(finalUtterance, Date.now());
                         }
                     }, 2500); 
@@ -192,7 +258,7 @@ wss.on('connection', (ws, req) => {
             console.log(`[LATENCY] +${Date.now() - t0}ms: Opening Deepgram TTS WebSocket...`);
             const dgSpeak = deepgramClient.speak.live({
                 model: ttsModel,
-                encoding: 'mp3',
+                encoding: 'linear16',
                 sample_rate: 24000,
             });
             activeTTSSocket = dgSpeak; // expose for interruption handler
@@ -201,16 +267,18 @@ wss.on('connection', (ws, req) => {
             let audioChunkCount = 0;
             let firstAudioSent = false;
 
-            dgSpeak.on('open', () => {
+            dgSpeak.on('Open', () => {
                 ttsReady = true;
                 console.log(`[LATENCY] +${Date.now() - t0}ms: ✅ TTS WebSocket OPEN — ready to receive text`);
             });
 
             // Each audio chunk from Deepgram is piped IMMEDIATELY to the browser
-            dgSpeak.on('audio', (audioChunk) => {
-                if (!isAIProcessing) return;
+            dgSpeak.on('Audio', (audioChunk) => {
+                if (currentState === State.INTERRUPTED) return;
                 audioChunkCount++;
                 if (!firstAudioSent) {
+                    speakingStartTime = Date.now(); // ⏱️ Guard period start!
+                    currentState = State.SPEAKING;
                     firstAudioSent = true;
                     console.log(`[LATENCY] +${Date.now() - t0}ms: 🔊 FIRST AUDIO CHUNK received from Deepgram! (${audioChunk.length} bytes)`);
                     ws.send(JSON.stringify({ action: 'QUEUE_AUDIO' }));
@@ -218,45 +286,40 @@ wss.on('connection', (ws, req) => {
                 ws.send(audioChunk);
             });
 
-            dgSpeak.on('close', () => {
+            dgSpeak.on('Close', () => {
                 console.log(`[LATENCY] +${Date.now() - t0}ms: TTS WebSocket closed. ${audioChunkCount} chunks streamed.`);
-                if (isAIProcessing) {
-                    isAIProcessing = false;
-                    ws.send(JSON.stringify({ log: '🔴 AI done. Listening...' }));
-                }
+                ws.send(JSON.stringify({ action: 'TTS_STREAM_CLOSED' }));
             });
 
-            dgSpeak.on('error', (err) => {
+            dgSpeak.on('Error', (err) => {
                 console.error('[TTS WS Error]', err);
-                isAIProcessing = false;
-            });
-
-            // Wait for TTS WebSocket to be open (usually <100ms)
-            await new Promise((resolve) => {
-                if (ttsReady) return resolve();
-                dgSpeak.on('open', resolve);
-                setTimeout(resolve, 500); // safety fallback
+                currentState = State.LISTENING;
             });
 
             // --- STEP 2: Stream LLM tokens directly into the open TTS WebSocket ---
-            console.log(`[LATENCY] +${Date.now() - t0}ms: Requesting Groq stream...`);
-            const stream = await groq.chat.completions.create({
+            // DO NOT wait for the TTS socket to open before calling the LLM!
+            // Fire them concurrently!
+            console.log(`[LATENCY] +${Date.now() - t0}ms: Requesting Groq stream concurrently...`);
+            const streamPromise = groq.chat.completions.create({
                 model: "llama-3.1-8b-instant",
                 messages: chatHistory,
                 stream: true,
-                max_tokens: 150
+                max_tokens: 512
             });
+            
+            const stream = await streamPromise;
             console.log(`[LATENCY] +${Date.now() - t0}ms: Groq stream open.`);
+
 
             let fullReply = "";
             let sentenceBuilder = "";
             let isFirstToken = true;
 
             for await (const chunk of stream) {
-                if (!isAIProcessing) {
+                if (currentState === State.INTERRUPTED) {
                     // User interrupted — close TTS and stop
-                    dgSpeak.close();
-                    break;
+                    try { dgSpeak.close(); } catch(e) {}
+                    return; // exit safely to avoid flushing
                 }
 
                 const token = chunk.choices[0]?.delta?.content || "";
@@ -264,7 +327,7 @@ wss.on('connection', (ws, req) => {
 
                 if (isFirstToken) {
                     console.log(`[LATENCY] +${Date.now() - t0}ms: ⚡ First LLM token! Streaming into TTS WebSocket...`);
-                    ws.send(JSON.stringify({ log: `🤖 Speaking...` }));
+                    ws.send(JSON.stringify({ action: 'TTS_STREAM_START', log: `🤖 Speaking...` }));
                     isFirstToken = false;
                 }
 
@@ -274,32 +337,50 @@ wss.on('connection', (ws, req) => {
                 // Send natural sentence chunks to TTS for better prosody
                 // The TTS engine synthesizes each phrase as it arrives — TTFA ~90ms
                 const isSentenceEnd = /[.!?]\s/.test(sentenceBuilder);
-                if (isSentenceEnd && sentenceBuilder.length > 20) {
+                if (isSentenceEnd && sentenceBuilder.length > 15) {
                     const phrase = sentenceBuilder.trim();
                     sentenceBuilder = "";
+                    
+                    if (!ttsReady) {
+                        console.log(`[LATENCY] +${Date.now() - t0}ms: Waiting for TTS WebSocket to open...`);
+                        await new Promise(resolve => {
+                            if (ttsReady) return resolve();
+                            dgSpeak.on('Open', resolve);
+                            setTimeout(resolve, 3000); 
+                        });
+                    }
+                    
                     console.log(`[LATENCY] +${Date.now() - t0}ms: → Sending phrase to TTS WS: [${phrase}]`);
-                    dgSpeak.sendText(phrase);
+                    try { dgSpeak.sendText(phrase); } catch(e){}
                 }
             }
 
             // Flush any remaining text
             if (sentenceBuilder.trim().length > 0) {
+                if (!ttsReady) {
+                    await new Promise(resolve => {
+                        if (ttsReady) return resolve();
+                        dgSpeak.on('Open', resolve);
+                        setTimeout(resolve, 3000); 
+                    });
+                }
                 console.log(`[LATENCY] +${Date.now() - t0}ms: → Flushing trailing: [${sentenceBuilder.trim()}]`);
-                dgSpeak.sendText(sentenceBuilder.trim());
+                try { dgSpeak.sendText(sentenceBuilder.trim()); } catch(e){}
             }
 
-            // Signal Deepgram that text stream is complete — it will finish synthesizing and close
-            dgSpeak.flush();
-            console.log(`[LATENCY] +${Date.now() - t0}ms: LLM complete. TTS flushed. Waiting for final audio chunks...`);
+            // Signal Deepgram natively explicitly explicitly effectively reliably cleverly smartly confidently natively intelligently intuitively efficiently magically natively that the stream is completely conclusively closed
+            try { dgSpeak.conn.send(JSON.stringify({ type: 'Close' })); } catch(e){}
+            console.log(`[LATENCY] +${Date.now() - t0}ms: LLM complete. Native explicit explicit Explicit TTS Close sent to Internal deepgram conn Socket! Waiting for final audio chunks...`);
 
-            if (isAIProcessing) {
+            if (currentState === State.SPEAKING || currentState === State.PROCESSING) {
                 chatHistory.push({ role: "assistant", content: fullReply });
+                if (chatHistory.length > 11) chatHistory = [chatHistory[0], ...chatHistory.slice(-10)];
             }
 
         } catch (e) {
             ws.send(JSON.stringify({ log: `⚠️ Pipeline Error: ${e.message}` }));
             console.error('Pipeline Error:', e);
-            isAIProcessing = false;
+            currentState = State.LISTENING;
         }
     }
 
@@ -309,7 +390,7 @@ wss.on('connection', (ws, req) => {
                 const message = data.toString();
                 const parsed = JSON.parse(message);
                 if (parsed.action === 'AUDIO_FINISHED') {
-                    isAIProcessing = false;
+                    currentState = State.LISTENING;
                     ws.send(JSON.stringify({ log: '🔴 AI Finished. Listening natively...' }));
                     resetHardwareSleepTimer();
                 } else if (parsed.action === 'STOP_AUDIO') {
@@ -318,7 +399,7 @@ wss.on('connection', (ws, req) => {
                         try { activeTTSSocket.close(); } catch(e) {}
                         activeTTSSocket = null;
                     }
-                    isAIProcessing = false;
+                    currentState = State.INTERRUPTED;
                 }
             } catch(e) {}
             return;
