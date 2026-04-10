@@ -7,6 +7,7 @@ const OpenAI = require('openai');
 const { createClient } = require('@deepgram/sdk');
 const path = require('path');
 require('dotenv').config();
+const { Debug } = require('./debug-logger');
 
 // Deepgram SDK client for WebSocket streaming TTS
 const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
@@ -39,8 +40,9 @@ wss.on('connection', (ws, req) => {
     let utteranceTimer = null; 
     let hardwareSleepTimer = null; 
 
-    // Aggressive VAD matrix mathematically explicitly safely reliably smoothly gracefully appropriately logically!
-    let url = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true';
+    // utterance_end_ms: Deepgram's own VAD fires UtteranceEnd after 1800ms of genuine audio silence.
+    // This is the PRIMARY Gate 2 trigger — replaces our hacky 'time since last isFinal' timers.
+    let url = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&utterance_end_ms=1800&vad_events=true';
     
     if (isHardware) {
          url += '&encoding=linear16&sample_rate=16000&channels=1';
@@ -82,30 +84,68 @@ wss.on('connection', (ws, req) => {
          const hasStrongPunctuation = /[.?!]$/.test(trimmedText);
          const words = text.toLowerCase().split(/\s+/);
          
-         // Strong punctuation + enough words = done
+         // § 10.3 Yield Phrase Fast-Path: explicit turn-transfer signals = definite EOT
+         const yieldPhrases = [
+             /\bwhat do you think\b/i,
+             /\bdoes that make sense\b/i,
+             /\byou know what i mean\b/i,
+             /\bdo you understand\b/i,
+             /\bcan you hear me\b/i,
+             /\bare you (there|listening|with me)\b/i,
+             /\bso anyway\b/i,
+             /\bright\?$/i,           // "right?" at end only
+             /\bdo you get (it|that)\b/i,
+             /\bunless you have.*\?$/i,
+         ];
+         if (yieldPhrases.some(p => p.test(trimmedText))) return true;
+
+         // Check the TAIL SENTENCE of long accumulated text for setup phrases.
+         // e.g. after 90-word enumeration, user says "I'm going to talk about them all."
+         // isLogicallyComplete would pass (period + words) but it's a setup phrase at the tail.
+         const sentences = trimmedText.split(/(?<=[.?!])\s+/);
+         const lastSentence = sentences[sentences.length - 1].trim();
+         const tailSetupPatterns = [
+             /^(so\s+)?i('m|\s+am)\s+(going|about)\s+to\b/i,
+             /^(so\s+)?let\s+me\b/i,
+             /^i\s+want\s+(you\s+to|to)\b/i,
+             /^i\s+(would|'d)\s+like\s+to\b/i,
+             /^i('ll|\s+will)\s+(try\s+to|start|begin|continue|keep)\b/i,
+         ];
+         if (tailSetupPatterns.some(p => p.test(lastSentence))) return false;
+
+         // Strong terminal punctuation + enough words = high-confidence EOT
          if (hasStrongPunctuation && words.length >= 4) return true;
 
          const lastWord = words[words.length - 1].replace(/[^a-z]/g, '');
          if (continuationWords.has(lastWord)) return false;
 
-         // FIX: "Setup phrase" detection — these opening patterns mean the user hasn't started yet
-         // e.g. "I'm going to say a long sentence" sounds complete but is clearly an announcement
+         // Setup phrases mean the user is announcing intent, not completing a thought
          const setupPhrasePatterns = [
-             /^(so\s+)?i('m|\s+am)\s+(going|about)\s+to\b/i,   // "I'm going to..."
-             /^(so\s+)?let\s+me\b/i,                           // "Let me..."
-             /^i\s+want\s+(you\s+to|to)\b/i,                   // "I want you to / I want to..."
-             /^i\s+(would|'d)\s+like\s+to\b/i,                 // "I'd like to..."
-             /\band\s+i\s+want\b/i,                            // "...and I want"
-             /\bbefore\s+i\b/i,                                 // "...before I"
-             /\bwithout\s+(getting|being|having)\b/i,           // "...without getting"
-             /\bso\s+that\b/i,                                  // "...so that"
+             /^(so\s+)?i('m|\s+am)\s+(going|about)\s+to\b/i,
+             /^(so\s+)?let\s+me\b/i,
+             /^i\s+want\s+(you\s+to|to)\b/i,
+             /^i\s+(would|'d)\s+like\s+to\b/i,
+             /\band\s+i\s+want\b/i,
+             /\bbefore\s+i\b/i,
+             /\bwithout\s+(getting|being|having)\b/i,
+             /\bso\s+that\b/i,
          ];
          if (setupPhrasePatterns.some(p => p.test(trimmedText))) return false;
 
-         // FIX: Raised minimum to 8 words — 6-7 word fragments are still too ambiguous unpunctuated
-         if (words.length <= 7 && !hasStrongPunctuation) return false;
-         
-         return true;
+         // CRITICAL FIX: Do NOT return true for long sentences without punctuation.
+         // A 15-word sentence mid-thought is NOT complete just because it's long.
+         // Gate 2 must be CONSERVATIVE — only return true on high-confidence signals.
+         // All other cases fall through to the adaptive failsafe timer (which scales with length).
+         return false;
+    }
+
+    // § 5.2 Word-count-adaptive silence threshold
+    // base 600ms + 80ms per word, capped at 1400ms
+    // Short utterances get fast response. Long ones get patience.
+    function adaptiveHangover(text, state) {
+        if (state === State.INTERRUPTED) return 1400; // max patience after barge-in
+        const wordCount = text ? text.trim().split(/\s+/).length : 0;
+        return Math.min(600 + wordCount * 80, 1400);
     }
 
     let silenceHangoverTimer = null;
@@ -114,6 +154,28 @@ wss.on('connection', (ws, req) => {
     // Named so WAKE reconnection can re-attach it to the new deepgramLive socket
     async function handleDeepgramMessage(data) {
         const response = JSON.parse(data.toString());
+
+        // PRIMARY EOT TRIGGER: Deepgram's own VAD fires this after utterance_end_ms of audio silence.
+        // This replaces our 'setTimeout(gate2, hangover)' math which was based on isFinal timing,
+        // not actual audio energy. UtteranceEnd = real silence confirmed by Deepgram.
+        if (response.type === 'UtteranceEnd') {
+            console.log(`[UTTERANCE_END] Deepgram VAD confirmed speech end.`);
+            if (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED) {
+                if (silenceHangoverTimer) clearTimeout(silenceHangoverTimer);
+                await triggerGate2Check();
+            }
+            return;
+        }
+
+        if (response.type === 'SpeechStarted') {
+            // Deepgram detected speech energy resuming — cancel any pending failsafe timer
+            if (utteranceTimer) {
+                clearTimeout(utteranceTimer);
+                Debug.timerCancelled('utteranceTimer', 'SpeechStarted_deepgram');
+                utteranceTimer = null;
+            }
+            return;
+        }
         
         if (response.type !== 'Results') {
             process.stdout.write('~'); 
@@ -124,12 +186,18 @@ wss.on('connection', (ws, req) => {
         const isFinal = response.is_final;
         
         if (transcript.trim().length > 0) {
-            // --- GATE 1: ACOUSTIC VAD TRACKING ---
-            // If we receive ANY text, clear the hangover timer
-            if (silenceHangoverTimer) {
-                clearTimeout(silenceHangoverTimer);
+            // Cancel the failsafe timer when new speech arrives (user is still talking)
+            if (utteranceTimer) {
+                clearTimeout(utteranceTimer);
+                Debug.timerCancelled('utteranceTimer', 'new_speech_arrived');
+                utteranceTimer = null;
             }
+            // silenceHangoverTimer is now only used as a FALLBACK if UtteranceEnd never arrives
+            // (network issue, very long continuous speech, etc.) — reset it on each chunk
+            if (silenceHangoverTimer) clearTimeout(silenceHangoverTimer);
             
+            Debug.transcript(transcript, isFinal, currentState);
+
             if (isFinal) {
                 resetHardwareSleepTimer(); 
                 
@@ -175,14 +243,23 @@ wss.on('connection', (ws, req) => {
                     }).catch(err => console.log('[CHECKPOINT] Interruption eval error:', err));
                 } else if (currentState === State.LISTENING || currentState === State.IDLE) {
                     console.log(`[CHECKPOINT] Standard Appending to Builder: "${transcript}"`);
-                    transcriptBuilder += transcript + " ";
-                    latestInterim = ""; 
+                    // Dedup: check if builder already contains this isFinal (can happen when
+                    // the same text was merged from latestInterim by a previous Gate2 check)
+                    const normNew = transcript.trim().toLowerCase();
+                    const normBuilder = transcriptBuilder.trim().toLowerCase();
+                    if (!normBuilder.includes(normNew)) {
+                        transcriptBuilder += transcript + " ";
+                        Debug.builderState('append_final', transcript, transcriptBuilder);
+                    } else {
+                        Debug.builderState('skip_dedup_final', transcript, transcriptBuilder);
+                        console.log(`[CHECKPOINT] isFinal already in builder — skipping: "${transcript}"`);
+                    }
+                    latestInterim = "";
                     ws.send(JSON.stringify({ log: `👂 Hearing: "${transcriptBuilder.trim()}"...` }));
                 } else if (currentState === State.INTERRUPTED) {
-                    // INTERRUPTED: user kept talking after barge-in — append to builder
-                    // Gate 2's 300ms timer will pick up the full utterance
                     transcriptBuilder += transcript + " ";
                     latestInterim = "";
+                    Debug.builderState('append_interrupted', transcript, transcriptBuilder);
                     console.log(`[CHECKPOINT] [INTERRUPTED] Appending continued speech: "${transcript}"`);
                 }
             } else if (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED) {
@@ -191,75 +268,109 @@ wss.on('connection', (ws, req) => {
                 ws.send(JSON.stringify({ log: `👂 Hearing: "${(transcriptBuilder + " " + latestInterim).trim()}"...` }));
             }
 
-            // Re-arm Gate 1 Hangover Tracking
-            // FIX: Use patience mode after interruption — user needs longer to finish their thought
+            // FALLBACK: keep a long-duration silenceHangoverTimer in case UtteranceEnd
+            // never arrives (e.g. network jitter, very long continuous speech >30s).
+            // UtteranceEnd at 1800ms is the primary trigger; this fires at 4000ms as safety net.
             if (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED) {
-                const hangover = currentState === State.INTERRUPTED ? 1200 : 700;
-                silenceHangoverTimer = setTimeout(triggerGate2Check, hangover);
+                const currentText = (transcriptBuilder + " " + latestInterim).trim();
+                const fallbackMs = 4000; // Fixed: UtteranceEnd handles adaptive timing
+                silenceHangoverTimer = setTimeout(triggerGate2Check, fallbackMs);
             }
         }
     }
 
+    let backchannelCooldown = false; // prevent backchannel spam
+
     async function triggerGate2Check() {
-         console.log(`[GATE 1 PASSED] 700ms Silence Hangover hit.`);
-         // FIX: properly guard against re-entrant calls
+         // ARCHITECTURAL FIX: latestInterim is READ-ONLY for evaluation.
+         // It NEVER gets committed to transcriptBuilder here.
+         // Only Deepgram isFinal results write to transcriptBuilder.
+         // This eliminates the ghost-prefix duplication bug:
+         //   e.g. interim "Let's see" merged → then isFinal "Let's see if..." appended
+         //        → builder = "Let's see Let's see if..." (corrupted LLM input)
+         const evalText = (transcriptBuilder + " " + latestInterim).trim();
+         const hangoverMs = adaptiveHangover(evalText, currentState);
+         console.log(`[GATE 1 PASSED] ${hangoverMs}ms Silence Hangover hit. Evaluating: "${evalText.substring(0, 80)}..."`);
+
          if (gate2Executing) {
              console.log(`[GATE 2] Already executing — skipping duplicate fire.`);
              return;
          }
          gate2Executing = true;
 
-         if (latestInterim.trim().length > 0) {
-             const interimTrimmed = latestInterim.trim();
-             const builderTrimmed = transcriptBuilder.trim().toLowerCase();
-             // FIX: Dedup — only append interim if it's not already captured at the tail of the builder
-             // Prevents: "And let" [pause] -> builder="And let" -> user says more -> interim="Let me try" ->
-             // Gate 1 fires -> appends "Let me try" even though builder already has a version of it
-             if (!builderTrimmed.endsWith(interimTrimmed.toLowerCase())) {
-                 console.log(`[CHECKPOINT] 🔄 Merging interim into Builder: "${interimTrimmed}"`);
-                 transcriptBuilder += interimTrimmed + " ";
-             } else {
-                 console.log(`[CHECKPOINT] Interim already in Builder — skipping: "${interimTrimmed}"`);
-             }
-             latestInterim = "";
-         }
-
-         const finalUtterance = transcriptBuilder.trim();
-         if (finalUtterance.length === 0) {
+         if (evalText.length === 0) {
              gate2Executing = false;
              return;
          }
 
-         // --- GATE 2: SEMANTIC EVALUATION ---
-         console.log(`[GATE 2 PENDING] Evaluating Semantic Completeness: "${finalUtterance}"`);
-         
-         const passesFastHeuristics = isLogicallyComplete(finalUtterance);
+         Debug.gate1(hangoverMs, evalText, currentState);
+
+         console.log(`[GATE 2 PENDING] Evaluating: "${evalText.substring(0, 120)}"`);
+         const passesFastHeuristics = isLogicallyComplete(evalText);
+         Debug.gate2Eval(
+             evalText,
+             passesFastHeuristics,
+             passesFastHeuristics ? 'fast_heuristic' : 'conservative_return_false',
+             evalText.trim().split(/\s+/).length,
+             /[.?!]$/.test(evalText.trim())
+         );
 
          if (passesFastHeuristics) {
-             console.log(`[GATE 2 PASSED] Fast Heuristics matched. Firing LLM.`);
+             console.log(`[GATE 2 PASSED] Firing LLM.`);
+             // Capture the combined committed + interim text as the utterance to send
+             const utteranceToSend = evalText;
              transcriptBuilder = "";
+             latestInterim = "";
              currentState = State.PROCESSING;
+             Debug.gate2Fire(utteranceToSend, 'fast_heuristic');
+             Debug.stateChange('LISTENING', 'PROCESSING', 'gate2_passed');
              gate2Executing = false;
-             await generateAndPlay(finalUtterance, Date.now());
+             await generateAndPlay(utteranceToSend, Date.now());
          } else {
-             console.log(`[GATE 2 EXTENDING] Sentence incomplete. Waiting up to 1400ms for more speech...`);
-             // Gate 2 fail: user is mid-thought. Wait a generous extra window.
-             // If new audio arrives, Gate 1 will fire again and reset the hangover.
+             console.log(`[GATE 2 EXTENDING] Sentence incomplete. Using adaptive fallback...`);
+
+             // § 10.1-10.2 Backchannel injection: let user know we're still listening
+             if (!backchannelCooldown && currentState !== State.SPEAKING && currentState !== State.PROCESSING) {
+                 const backchannels = ["Mm-hmm.", "I see.", "Go on.", "Yeah.", "Mhm."];
+                 const bc = backchannels[Math.floor(Math.random() * backchannels.length)];
+                 backchannelCooldown = true;
+                 setTimeout(() => { backchannelCooldown = false; }, 8000);
+                 console.log(`[BACKCHANNEL] Injecting: "${bc}"`);
+                 (async () => {
+                     try {
+                         const bcSpeak = deepgramClient.speak.live({ model: ttsModel, encoding: 'linear16', sample_rate: 24000 });
+                         bcSpeak.on('Audio', chunk => ws.send(chunk));
+                         bcSpeak.on('Open', () => {
+                             bcSpeak.sendText(bc);
+                             setTimeout(() => { try { bcSpeak.requestClose(); } catch(e) {} }, 500);
+                         });
+                     } catch(e) { console.log('[BACKCHANNEL] TTS error:', e.message); }
+                 })();
+             }
+
+             // Adaptive failsafe: fire after scaled patience regardless of heuristics
+             const wordsSoFar = evalText.split(/\s+/).length;
+             const fallbackMs = Math.min(1500 + wordsSoFar * 120, 5000);
              if (utteranceTimer) clearTimeout(utteranceTimer);
              utteranceTimer = setTimeout(async () => {
-                  console.log(`[DEBUG] 🕒 Hard Failsafe Triggered (1400ms).`);
-                  const captured = transcriptBuilder.trim();
+                  // Capture the COMBINED state at fire time (not just the committed builder)
+                  const captured = (transcriptBuilder + " " + latestInterim).trim();
+                  console.log(`[DEBUG] 🕒 Adaptive Failsafe Triggered (${fallbackMs}ms / ${wordsSoFar} words): "${captured.substring(0,80)}"`);
+                  Debug.failsafeFired(fallbackMs, wordsSoFar, captured);
+                  Debug.gate2Fire(captured, 'adaptive_failsafe');
                   transcriptBuilder = "";
+                  latestInterim = "";
                   gate2Executing = false;
                   utteranceTimer = null;
                   if (captured.length > 0 && (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED)) {
-                       currentState = State.PROCESSING; 
+                       currentState = State.PROCESSING;
+                       Debug.stateChange('LISTENING', 'PROCESSING', 'failsafe');
                        await generateAndPlay(captured, Date.now());
                   }
-             }, 1400); 
-             gate2Executing = false; // allow re-entry when new words arrive
+             }, fallbackMs);
+             gate2Executing = false;
          }
-    } // end handleDeepgramMessage
+    } // end triggerGate2Check
 
     // Attach to initial connection
     deepgramLive.on('message', handleDeepgramMessage);
