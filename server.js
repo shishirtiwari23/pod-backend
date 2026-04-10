@@ -40,7 +40,7 @@ wss.on('connection', (ws, req) => {
     let hardwareSleepTimer = null; 
 
     // Aggressive VAD matrix mathematically explicitly safely reliably smoothly gracefully appropriately logically!
-    let url = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&endpointing=1000&interim_results=true';
+    let url = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true';
     
     if (isHardware) {
          url += '&encoding=linear16&sample_rate=16000&channels=1';
@@ -61,7 +61,19 @@ wss.on('connection', (ws, req) => {
          console.log(`📡 [Deepgram] Socket strictly terminated. Code: ${event}`);
     });
 
-    const continuationWords = new Set(["and", "or", "but", "because", "so", "if", "then", "like", "which", "that", "the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "on", "with", "have", "has", "had", "just", "about", "some", "my", "your", "their", "our", "very", "much", "many"]);
+    // Expanded continuation word set — these words at end of sentence = user isn't done
+    const continuationWords = new Set([
+        "and", "or", "but", "because", "so", "if", "then", "like", "which", "that",
+        "the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "on", "with",
+        "have", "has", "had", "just", "about", "some", "my", "your", "their", "our",
+        "very", "much", "many",
+        // NEW: these are strong mid-sentence continuers the old set was missing
+        "next", "though", "yet", "when", "where", "how", "also", "too",
+        "while", "since", "before", "after", "until", "unless", "whether",
+        "although", "however", "still", "than", "by", "at", "its", "this",
+        "what", "who", "whom", "whose", "get", "got", "go", "going", "not",
+        "now", "here", "there", "really", "even"
+    ]);
 
     function isLogicallyComplete(text) {
          if (!text || text.length < 5) return false;
@@ -70,145 +82,187 @@ wss.on('connection', (ws, req) => {
          const hasStrongPunctuation = /[.?!]$/.test(trimmedText);
          const words = text.toLowerCase().split(/\s+/);
          
-         // If a user definitively ends a substantial sentence with punctuation, respect it natively
+         // Strong punctuation + enough words = done
          if (hasStrongPunctuation && words.length >= 4) return true;
 
          const lastWord = words[words.length - 1].replace(/[^a-z]/g, '');
          if (continuationWords.has(lastWord)) return false;
+
+         // FIX: "Setup phrase" detection — these opening patterns mean the user hasn't started yet
+         // e.g. "I'm going to say a long sentence" sounds complete but is clearly an announcement
+         const setupPhrasePatterns = [
+             /^(so\s+)?i('m|\s+am)\s+(going|about)\s+to\b/i,   // "I'm going to..."
+             /^(so\s+)?let\s+me\b/i,                           // "Let me..."
+             /^i\s+want\s+(you\s+to|to)\b/i,                   // "I want you to / I want to..."
+             /^i\s+(would|'d)\s+like\s+to\b/i,                 // "I'd like to..."
+             /\band\s+i\s+want\b/i,                            // "...and I want"
+             /\bbefore\s+i\b/i,                                 // "...before I"
+             /\bwithout\s+(getting|being|having)\b/i,           // "...without getting"
+             /\bso\s+that\b/i,                                  // "...so that"
+         ];
+         if (setupPhrasePatterns.some(p => p.test(trimmedText))) return false;
+
+         // FIX: Raised minimum to 8 words — 6-7 word fragments are still too ambiguous unpunctuated
+         if (words.length <= 7 && !hasStrongPunctuation) return false;
          
-         // If phrase is very short AND doesn't have strong end punctuation, assume they are still thinking
-         // (e.g. "Right", "Yeah", "Okay" are short forms often followed by actual sentence)
-         if (words.length < 4 && !hasStrongPunctuation) return false;
-         
-         return true; // Predictive heuristic assumes complete
+         return true;
     }
 
-    deepgramLive.on('message', async (data) => {
+    let silenceHangoverTimer = null;
+    let gate2Executing = false;
+
+    // Named so WAKE reconnection can re-attach it to the new deepgramLive socket
+    async function handleDeepgramMessage(data) {
         const response = JSON.parse(data.toString());
         
         if (response.type !== 'Results') {
             process.stdout.write('~'); 
+            return;
         }
         
-        if (response.type === 'Results') {
-            const transcript = response.channel.alternatives[0].transcript;
-            const isFinal = response.is_final;
-            const speechFinal = response.speech_final;
-
-            if (transcript.trim().length > 0) {
-                // --- DEBUGGER TRACE ---
-                console.log(`\n[DEBUG STT] IsFinal: ${isFinal} | SpeechFinal: ${speechFinal} | Text: "${transcript}"`);
+        const transcript = response.channel.alternatives[0].transcript;
+        const isFinal = response.is_final;
+        
+        if (transcript.trim().length > 0) {
+            // --- GATE 1: ACOUSTIC VAD TRACKING ---
+            // If we receive ANY text, clear the hangover timer
+            if (silenceHangoverTimer) {
+                clearTimeout(silenceHangoverTimer);
+            }
+            
+            if (isFinal) {
+                resetHardwareSleepTimer(); 
                 
-                // 1. Always wipe the timer if you make ANY noise
-                if (utteranceTimer) clearTimeout(utteranceTimer);
-                
-                // Track interim speech so Failsafe Timer doesn't drop words
-                if (!isFinal) latestInterim = transcript;
-
-                // 2. Only commit locked completed phrases sequentially
-                if (isFinal) {
-                    resetHardwareSleepTimer(); 
-                    if (currentState === State.PROCESSING || currentState === State.SPEAKING) {
-                        // Barge-In Guard: Ignore all interruptions in the first 500ms of speaking!
-                        if (currentState === State.SPEAKING && (Date.now() - speakingStartTime < 500)) {
-                            console.log(`[CHECKPOINT] 🛡️ Barge-In Guard active! Ignoring early interruption bounds.`);
-                            return;
-                        }
-                        
-                        console.log(`[CHECKPOINT] Analyzing Interruption Candidate: "${transcript}"`);
-                        const lastAI = chatHistory[chatHistory.length - 1]?.content || "speaking...";
-                        
-                        // Strict Native Hardware Echo Suppression Matrix
-                        // Eliminates 90% of self-interruptions if using external speakers
-                        const cleanAI = lastAI.replace(/[^a-zA-Z0-9\s]/g, '').toLowerCase().trim();
-                        const cleanUser = transcript.replace(/[^a-zA-Z0-9\s]/g, '').toLowerCase().trim();
-                        
-                        // Duration Gate: Needs to be ~200ms of continuous acoustic speech to qualify as human word
-                        if (cleanUser.length <= 15) {
-                            console.log(`[CHECKPOINT] ⏩ Duration Gate failed (too short to be interruption intent)`);
-                            return;
-                        }
-                        
-                        // If the transcript is a substring of what the AI just said (or vice versa)
-                        if (cleanUser.length > 5 && (cleanAI.includes(cleanUser) || cleanUser.includes(cleanAI))) {
-                            console.log(`[CHECKPOINT] 🔊 Hardware Echo Filtered! ("${transcript}")`);
-                            return;
-                        }
-                        
-                        // We do not await this, it runs in background
-                        groq.chat.completions.create({
-                            model: "llama-3.1-8b-instant",
-                            messages: [{
-                                role: "system",
-                                content: `The AI is actively saying: "${lastAI}". The microphone picks up: "${transcript}". Is this a meaningful interruption making a functional thought/question that physically demands an immediate new AI response? If it is the microphone accidentally hearing the AI's own voice (echo), reply strictly NO. If it is a brief passive backchannel (e.g. 'mhm', 'yeah', 'right', 'ok', 'nice', 'oh') or a short incomplete fragment, reply strictly NO. If it is ANY kind of deliberate user attempt to speak, interrupt, or change topic, reply strictly YES. If in doubt, ALWAYS reply YES.`
-                            }]
-                        }).then(res => {
-                            const verdict = res.choices[0].message.content.trim().toUpperCase();
-                            if (verdict.includes('YES')) {
-                                console.log(`[CHECKPOINT] 🛑 Meaningful Interruption Detected! Verdict is YES for: "${transcript}"`);
-                                currentState = State.INTERRUPTED;
-                                ws.send(JSON.stringify({ action: 'STOP_AUDIO', log: '⚠️ Meaningful Interruption Detected! Re-routing...' }));
-                                transcriptBuilder = transcript + " ";
-                            } else {
-                                console.log(`[CHECKPOINT] ⏩ Passive background noise ignored! Verdict is NO for: "${transcript}"`);
-                            }
-                        }).catch(err => console.log('[CHECKPOINT] Interruption eval error:', err));
-                    } else if (currentState === State.LISTENING || currentState === State.IDLE) {
-                        console.log(`[CHECKPOINT] Standard Appending to Builder: "${transcript}"`);
-                        transcriptBuilder += transcript + " ";
-                        latestInterim = ""; // clear interim since it's merged
-                        ws.send(JSON.stringify({ log: `👂 Hearing: "${transcriptBuilder.trim()}"...` }));
+                if (currentState === State.PROCESSING || currentState === State.SPEAKING) {
+                    // Barge-In Guard: strictly 600ms boundary per specs
+                    if (currentState === State.SPEAKING && (Date.now() - speakingStartTime < 600)) {
+                        console.log(`[CHECKPOINT] 🛡️ 600ms Barge-In Guard active! Ignoring early interruption bounds.`);
+                        return;
                     }
+                    
+                    console.log(`[CHECKPOINT] Analyzing Interruption Candidate: "${transcript}"`);
+                    const lastAI = chatHistory[chatHistory.length - 1]?.content || "speaking...";
+                    
+                    const cleanAI = lastAI.replace(/[^a-zA-Z0-9\s]/g, '').toLowerCase().trim();
+                    const cleanUser = transcript.replace(/[^a-zA-Z0-9\s]/g, '').toLowerCase().trim();
+                    
+                    if (cleanUser.length <= 15) return;
+                    if (cleanUser.length > 5 && (cleanAI.includes(cleanUser) || cleanUser.includes(cleanAI))) return;
+                    
+                    groq.chat.completions.create({
+                        model: "llama-3.1-8b-instant",
+                        messages: [{
+                            role: "system",
+                            content: `The AI is actively saying: "${lastAI}". The microphone picks up: "${transcript}". Is this a meaningful interruption making a functional thought/question that physically demands an immediate new AI response? If it is the microphone accidentally hearing the AI's own voice (echo), reply strictly NO. If it is a brief passive backchannel (e.g. 'mhm', 'yeah', 'right', 'ok', 'nice', 'oh') or a short incomplete fragment, reply strictly NO. If it is ANY kind of deliberate user attempt to speak, interrupt, or change topic, reply strictly YES. If in doubt, ALWAYS reply YES.`
+                        }]
+                    }).then(res => {
+                        const verdict = res.choices[0].message.content.trim().toUpperCase();
+                        if (verdict.includes('YES')) {
+                            console.log(`[CHECKPOINT] 🛑 Meaningful Interruption Detected! Verdict is YES for: "${transcript}"`);
+                            currentState = State.INTERRUPTED;
+                            ws.send(JSON.stringify({ action: 'STOP_AUDIO', log: '⚠️ Meaningful Interruption Detected! Re-routing...' }));
+                            // FIX: Set transcriptBuilder to EMPTY then let INTERRUPTED isFinal blocks accumulate
+                            // Don't pre-seed with partial — it was caught mid-sentence
+                            transcriptBuilder = "";
+                            latestInterim = transcript; // Track as interim so Gate 2 can pick it up
+                            // FIX: Extended to 1500ms — give user time to finish their thought
+                            // after AI stops speaking before we fire Gate 2
+                            if (silenceHangoverTimer) clearTimeout(silenceHangoverTimer);
+                            silenceHangoverTimer = setTimeout(triggerGate2Check, 1500);
+                        } else {
+                            console.log(`[CHECKPOINT] ⏩ Passive background noise ignored! Verdict is NO for: "${transcript}"`);
+                        }
+                    }).catch(err => console.log('[CHECKPOINT] Interruption eval error:', err));
+                } else if (currentState === State.LISTENING || currentState === State.IDLE) {
+                    console.log(`[CHECKPOINT] Standard Appending to Builder: "${transcript}"`);
+                    transcriptBuilder += transcript + " ";
+                    latestInterim = ""; 
+                    ws.send(JSON.stringify({ log: `👂 Hearing: "${transcriptBuilder.trim()}"...` }));
+                } else if (currentState === State.INTERRUPTED) {
+                    // INTERRUPTED: user kept talking after barge-in — append to builder
+                    // Gate 2's 300ms timer will pick up the full utterance
+                    transcriptBuilder += transcript + " ";
+                    latestInterim = "";
+                    console.log(`[CHECKPOINT] [INTERRUPTED] Appending continued speech: "${transcript}"`);
                 }
+            } else if (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED) {
+                // Tracking Interim continuously
+                latestInterim = transcript;
+                ws.send(JSON.stringify({ log: `👂 Hearing: "${(transcriptBuilder + " " + latestInterim).trim()}"...` }));
+            }
 
-                // 3. Fire explicitly when Deepgram mathematically detects the VAD 1500ms End-of-Thought
-                if (speechFinal) {
-                    console.log(`[CHECKPOINT] Deepgram native SpeechFinal flags triggered.`);
-                    const finalUtterance = transcriptBuilder.trim();
-                    if (!isLogicallyComplete(finalUtterance)) {
-                        console.log(`[CHECKPOINT] ⏭️ Sentence logically incomplete ("${finalUtterance}"). Waiting for Failsafe Timer...`);
-                    } else if (currentState === State.LISTENING || currentState === State.INTERRUPTED || currentState === State.IDLE) {
-                        console.log(`[CHECKPOINT] 🚀 Submitting Builder: "${transcriptBuilder.trim()}"`);
-                        transcriptBuilder = "";
-                        utteranceTimer = null;
-                        
-                        if (finalUtterance.length > 0) {
-                            console.log(`[CHECKPOINT] Locking pipeline -> PROCESSING!`);
-                            currentState = State.PROCESSING; 
-                            await generateAndPlay(finalUtterance, Date.now());
-                        }
-                    } else {
-                        console.log(`[CHECKPOINT] SpeechFinal triggered but AI is CURRENTLY ${currentState}. Ignition bypassed.`);
-                    }
-                } 
-                
-                if (currentState === State.LISTENING || currentState === State.INTERRUPTED || currentState === State.IDLE) {
-                    // Fallback timer for 2500ms - catches incomplete sentences explicitly
-                    if (utteranceTimer) clearTimeout(utteranceTimer);
-                    utteranceTimer = setTimeout(async () => {
-                        console.log(`[DEBUG] 🕒 Failsafe Timer Triggered (2500ms).`);
-                        
-                        // Merge the latest interim transcript if Deepgram was taking too long to verify it!
-                        if (latestInterim.trim().length > 0) {
-                            console.log(`[CHECKPOINT] 🔄 Intercepting dropped Interim Transcript into Builder: "${latestInterim}"`);
-                            transcriptBuilder += latestInterim + " ";
-                            latestInterim = "";
-                        }
-                        
-                        const finalUtterance = transcriptBuilder.trim();
-                        transcriptBuilder = "";
-                        utteranceTimer = null;
-                        
-                        if (finalUtterance.length > 0 && (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED)) {
-                            console.log(`[CHECKPOINT] Locking pipeline natively via failsafe! Submitting: "${finalUtterance}"`);
-                            currentState = State.PROCESSING; 
-                            await generateAndPlay(finalUtterance, Date.now());
-                        }
-                    }, 2500); 
-                }
+            // Re-arm Gate 1 Hangover Tracking
+            // FIX: Use patience mode after interruption — user needs longer to finish their thought
+            if (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED) {
+                const hangover = currentState === State.INTERRUPTED ? 1200 : 700;
+                silenceHangoverTimer = setTimeout(triggerGate2Check, hangover);
             }
         }
-    });
+    }
+
+    async function triggerGate2Check() {
+         console.log(`[GATE 1 PASSED] 700ms Silence Hangover hit.`);
+         // FIX: properly guard against re-entrant calls
+         if (gate2Executing) {
+             console.log(`[GATE 2] Already executing — skipping duplicate fire.`);
+             return;
+         }
+         gate2Executing = true;
+
+         if (latestInterim.trim().length > 0) {
+             const interimTrimmed = latestInterim.trim();
+             const builderTrimmed = transcriptBuilder.trim().toLowerCase();
+             // FIX: Dedup — only append interim if it's not already captured at the tail of the builder
+             // Prevents: "And let" [pause] -> builder="And let" -> user says more -> interim="Let me try" ->
+             // Gate 1 fires -> appends "Let me try" even though builder already has a version of it
+             if (!builderTrimmed.endsWith(interimTrimmed.toLowerCase())) {
+                 console.log(`[CHECKPOINT] 🔄 Merging interim into Builder: "${interimTrimmed}"`);
+                 transcriptBuilder += interimTrimmed + " ";
+             } else {
+                 console.log(`[CHECKPOINT] Interim already in Builder — skipping: "${interimTrimmed}"`);
+             }
+             latestInterim = "";
+         }
+
+         const finalUtterance = transcriptBuilder.trim();
+         if (finalUtterance.length === 0) {
+             gate2Executing = false;
+             return;
+         }
+
+         // --- GATE 2: SEMANTIC EVALUATION ---
+         console.log(`[GATE 2 PENDING] Evaluating Semantic Completeness: "${finalUtterance}"`);
+         
+         const passesFastHeuristics = isLogicallyComplete(finalUtterance);
+
+         if (passesFastHeuristics) {
+             console.log(`[GATE 2 PASSED] Fast Heuristics matched. Firing LLM.`);
+             transcriptBuilder = "";
+             currentState = State.PROCESSING;
+             gate2Executing = false;
+             await generateAndPlay(finalUtterance, Date.now());
+         } else {
+             console.log(`[GATE 2 EXTENDING] Sentence incomplete. Waiting up to 1400ms for more speech...`);
+             // Gate 2 fail: user is mid-thought. Wait a generous extra window.
+             // If new audio arrives, Gate 1 will fire again and reset the hangover.
+             if (utteranceTimer) clearTimeout(utteranceTimer);
+             utteranceTimer = setTimeout(async () => {
+                  console.log(`[DEBUG] 🕒 Hard Failsafe Triggered (1400ms).`);
+                  const captured = transcriptBuilder.trim();
+                  transcriptBuilder = "";
+                  gate2Executing = false;
+                  utteranceTimer = null;
+                  if (captured.length > 0 && (currentState === State.LISTENING || currentState === State.IDLE || currentState === State.INTERRUPTED)) {
+                       currentState = State.PROCESSING; 
+                       await generateAndPlay(captured, Date.now());
+                  }
+             }, 1400); 
+             gate2Executing = false; // allow re-entry when new words arrive
+         }
+    } // end handleDeepgramMessage
+
+    // Attach to initial connection
+    deepgramLive.on('message', handleDeepgramMessage);
 
     deepgramLive.on('error', (err) => {
         console.error('⚠️ Deepgram streaming error', err);
@@ -266,10 +320,25 @@ wss.on('connection', (ws, req) => {
             let ttsReady = false;
             let audioChunkCount = 0;
             let firstAudioSent = false;
+            // TTS phrase queue — phrases are built while TTS socket handshake is in-flight
+            // When TTS opens, drain queue immediately in order. No async blocking in LLM loop.
+            const ttsQueue = [];
+
+            function sendOrQueue(text) {
+                if (ttsReady) {
+                    try { dgSpeak.sendText(text); } catch(e) {}
+                } else {
+                    ttsQueue.push(text);
+                }
+            }
 
             dgSpeak.on('Open', () => {
                 ttsReady = true;
-                console.log(`[LATENCY] +${Date.now() - t0}ms: ✅ TTS WebSocket OPEN — ready to receive text`);
+                console.log(`[LATENCY] +${Date.now() - t0}ms: ✅ TTS WebSocket OPEN — draining ${ttsQueue.length} queued phrases`);
+                // Drain buffered phrases that arrived before socket opened
+                while (ttsQueue.length > 0) {
+                    try { dgSpeak.sendText(ttsQueue.shift()); } catch(e) {}
+                }
             });
 
             // Each audio chunk from Deepgram is piped IMMEDIATELY to the browser
@@ -334,43 +403,38 @@ wss.on('connection', (ws, req) => {
                 fullReply += token;
                 sentenceBuilder += token;
 
-                // Send natural sentence chunks to TTS for better prosody
-                // The TTS engine synthesizes each phrase as it arrives — TTFA ~90ms
+                // Stream phrases to TTS as they complete — no blocking await
                 const isSentenceEnd = /[.!?]\s/.test(sentenceBuilder);
                 if (isSentenceEnd && sentenceBuilder.length > 15) {
                     const phrase = sentenceBuilder.trim();
                     sentenceBuilder = "";
-                    
-                    if (!ttsReady) {
-                        console.log(`[LATENCY] +${Date.now() - t0}ms: Waiting for TTS WebSocket to open...`);
-                        await new Promise(resolve => {
-                            if (ttsReady) return resolve();
-                            dgSpeak.on('Open', resolve);
-                            setTimeout(resolve, 3000); 
-                        });
-                    }
-                    
-                    console.log(`[LATENCY] +${Date.now() - t0}ms: → Sending phrase to TTS WS: [${phrase}]`);
-                    try { dgSpeak.sendText(phrase); } catch(e){}
+                    console.log(`[LATENCY] +${Date.now() - t0}ms: → Queueing phrase: [${phrase.substring(0, 60)}]`);
+                    sendOrQueue(phrase);
                 }
             }
 
-            // Flush any remaining text
+            // Flush any remaining text that didn't hit a sentence boundary
             if (sentenceBuilder.trim().length > 0) {
+                // Wait for TTS to be ready before flushing final fragment
                 if (!ttsReady) {
                     await new Promise(resolve => {
-                        if (ttsReady) return resolve();
-                        dgSpeak.on('Open', resolve);
-                        setTimeout(resolve, 3000); 
+                        if (ttsReady) { resolve(); return; }
+                        dgSpeak.on('Open', () => resolve());
+                        setTimeout(resolve, 3000);
                     });
+                    // Drain queue before the trailing flush
+                    while (ttsQueue.length > 0) {
+                        try { dgSpeak.sendText(ttsQueue.shift()); } catch(e) {}
+                    }
                 }
-                console.log(`[LATENCY] +${Date.now() - t0}ms: → Flushing trailing: [${sentenceBuilder.trim()}]`);
+                console.log(`[LATENCY] +${Date.now() - t0}ms: → Flushing trailing: [${sentenceBuilder.trim().substring(0, 60)}]`);
                 try { dgSpeak.sendText(sentenceBuilder.trim()); } catch(e){}
             }
 
-            // Signal Deepgram natively explicitly explicitly effectively reliably cleverly smartly confidently natively intelligently intuitively efficiently magically natively that the stream is completely conclusively closed
-            try { dgSpeak.conn.send(JSON.stringify({ type: 'Close' })); } catch(e){}
-            console.log(`[LATENCY] +${Date.now() - t0}ms: LLM complete. Native explicit explicit Explicit TTS Close sent to Internal deepgram conn Socket! Waiting for final audio chunks...`);
+            // FIX: use proper Deepgram SDK close instead of raw conn.send — the old method was
+            // bypassing the SDK's internal queue, causing the last audio chunk to be dropped
+            try { dgSpeak.requestClose(); } catch(e){}
+            console.log(`[LATENCY] +${Date.now() - t0}ms: LLM complete. TTS close requested. Waiting for final audio chunks...`);
 
             if (currentState === State.SPEAKING || currentState === State.PROCESSING) {
                 chatHistory.push({ role: "assistant", content: fullReply });
@@ -389,12 +453,41 @@ wss.on('connection', (ws, req) => {
             try {
                 const message = data.toString();
                 const parsed = JSON.parse(message);
+
+                // FIX: Handle WAKE action — reconnect Deepgram after hardware sleep
+                if (parsed.action === 'WAKE') {
+                    console.log('\n⚡ [WAKE] Reconnecting Deepgram STT after sleep...');
+                    if (deepgramLive) {
+                        try { deepgramLive.terminate(); } catch(e) {}
+                        deepgramLive = null;
+                    }
+                    // Reset pipeline state cleanly
+                    transcriptBuilder = "";
+                    latestInterim = "";
+                    currentState = State.LISTENING;
+                    utteranceTimer = null;
+                    silenceHangoverTimer = null;
+                    gate2Executing = false;
+
+                    const reconnectUrl = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&encoding=linear16&sample_rate=16000&channels=1';
+                    deepgramLive = new WebSocketClient(reconnectUrl, {
+                        headers: { 'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}` }
+                    });
+                    deepgramLive.on('open', () => {
+                        console.log('📡 [Deepgram] Reconnected after WAKE.');
+                        resetHardwareSleepTimer();
+                    });
+                    deepgramLive.on('message', handleDeepgramMessage);
+                    deepgramLive.on('error', (err) => console.error('⚠️ Deepgram error after WAKE:', err.message));
+                    deepgramLive.on('close', (code) => console.log(`📡 [Deepgram] Socket terminated. Code: ${code}`));
+                    return;
+                }
+
                 if (parsed.action === 'AUDIO_FINISHED') {
                     currentState = State.LISTENING;
                     ws.send(JSON.stringify({ log: '🔴 AI Finished. Listening natively...' }));
                     resetHardwareSleepTimer();
                 } else if (parsed.action === 'STOP_AUDIO') {
-                    // Kill the TTS WebSocket immediately to stop audio generation
                     if (activeTTSSocket) {
                         try { activeTTSSocket.close(); } catch(e) {}
                         activeTTSSocket = null;
@@ -405,7 +498,6 @@ wss.on('connection', (ws, req) => {
             return;
         }
         if (deepgramLive && deepgramLive.readyState === 1) {
-            // DO NOT block the stream during isAIProcessing natively otherwise Deepgram caches or drops the fragments! 
             process.stdout.write('.'); 
             deepgramLive.send(data); 
         } 
