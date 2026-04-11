@@ -4,6 +4,7 @@ const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
 const WebSocketClient = require('ws'); 
 const OpenAI = require('openai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { createClient } = require('@deepgram/sdk');
 const path = require('path');
 require('dotenv').config();
@@ -19,10 +20,62 @@ app.use(express.static(path.join(__dirname, '../simulator')));
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-const groq = new OpenAI({ 
+// ─── LLM Provider Setup ──────────────────────────────────────────────────────
+// Set LLM_PROVIDER=gemini in .env to use Gemini Flash.
+// Defaults to Groq (llama-3.1-8b-instant) if not set.
+// Both providers expose the same streamLLM() interface.
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || 'groq').toLowerCase();
+
+const groq = new OpenAI({
     apiKey: process.env.GROQ_API_KEY,
     baseURL: "https://api.groq.com/openai/v1"
 });
+
+const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const geminiModel = geminiClient.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+console.log(`🤖 LLM Provider: ${LLM_PROVIDER.toUpperCase()} | ${LLM_PROVIDER === 'gemini' ? 'gemini-2.0-flash' : 'llama-3.1-8b-instant'}`);
+
+// Unified LLM streaming function — returns an async iterable of token strings.
+// Callers just do: for await (const token of streamLLM(history)) { ... }
+async function* streamLLM(messages) {
+    if (LLM_PROVIDER === 'gemini') {
+        // Convert OpenAI-format history to Gemini format
+        // System prompt is injected as first user turn (Gemini doesn't have system role)
+        const systemMsg = messages.find(m => m.role === 'system');
+        const turns = messages.filter(m => m.role !== 'system');
+
+        const history = turns.slice(0, -1).map(m => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }],
+        }));
+
+        const userMessage = turns[turns.length - 1]?.content || '';
+        const chat = geminiModel.startChat({
+            history,
+            systemInstruction: systemMsg?.content,
+        });
+
+        const result = await chat.sendMessageStream(userMessage);
+        for await (const chunk of result.stream) {
+            const text = chunk.text();
+            if (text) yield text;
+        }
+    } else {
+        // Groq via OpenAI-compatible SDK
+        const stream = await groq.chat.completions.create({
+            model: 'llama-3.1-8b-instant',
+            messages,
+            stream: true,
+            max_tokens: 512,
+        });
+        for await (const chunk of stream) {
+            const token = chunk.choices[0]?.delta?.content || '';
+            if (token) yield token;
+        }
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are a helpful, extremely concise human-like conversational AI. You MUST respond in 1 or 2 short sentences. Absolutely DO NOT output robotic, flat text blocks, markdown, lists, asterisks, bullet points, or emojis, because your response will be directly fed into a voice synthesizer. Instead, dynamically inject verbal pauses using ellipses ("..."), dramatic questioning ("?!"), commas, and natural hesitation words ("Hmm", "Well", "Let's see") directly into your grammatical structure so the Text-To-Speech engine naturally breathes and pauses correctly! Make it sound like a real person talking natively!`;
 const ttsModel = "aura-zeus-en";
@@ -476,37 +529,23 @@ wss.on('connection', (ws, req) => {
                 currentState = State.LISTENING;
             });
 
-            // --- STEP 2: Stream LLM tokens directly into the open TTS WebSocket ---
-            // DO NOT wait for the TTS socket to open before calling the LLM!
-            // Fire them concurrently!
-            console.log(`[LATENCY] +${Date.now() - t0}ms: Requesting Groq stream concurrently...`);
-            const streamPromise = groq.chat.completions.create({
-                model: "llama-3.1-8b-instant",
-                messages: chatHistory,
-                stream: true,
-                max_tokens: 512
-            });
-            
-            const stream = await streamPromise;
-            console.log(`[LATENCY] +${Date.now() - t0}ms: Groq stream open.`);
-
+            // --- STEP 2: Stream LLM tokens via provider abstraction ---
+            // Both Groq and Gemini return an async iterable of token strings.
+            const providerLabel = LLM_PROVIDER === 'gemini' ? 'Gemini Flash' : 'Groq';
+            console.log(`[LATENCY] +${Date.now() - t0}ms: Requesting ${providerLabel} stream concurrently...`);
 
             let fullReply = "";
             let sentenceBuilder = "";
             let isFirstToken = true;
 
-            for await (const chunk of stream) {
+            for await (const token of streamLLM(chatHistory)) {
                 if (currentState === State.INTERRUPTED) {
-                    // User interrupted — close TTS and stop
                     try { dgSpeak.close(); } catch(e) {}
-                    return; // exit safely to avoid flushing
+                    return;
                 }
 
-                const token = chunk.choices[0]?.delta?.content || "";
-                if (!token) continue;
-
                 if (isFirstToken) {
-                    console.log(`[LATENCY] +${Date.now() - t0}ms: ⚡ First LLM token! Streaming into TTS WebSocket...`);
+                    console.log(`[LATENCY] +${Date.now() - t0}ms: ⚡ First ${providerLabel} token! Streaming into TTS WebSocket...`);
                     ws.send(JSON.stringify({ action: 'TTS_STREAM_START', log: `🤖 Speaking...` }));
                     isFirstToken = false;
                 }
@@ -514,7 +553,6 @@ wss.on('connection', (ws, req) => {
                 fullReply += token;
                 sentenceBuilder += token;
 
-                // Stream phrases to TTS as they complete — no blocking await
                 const isSentenceEnd = /[.!?]\s/.test(sentenceBuilder);
                 if (isSentenceEnd && sentenceBuilder.length > 15) {
                     const phrase = sentenceBuilder.trim();
@@ -580,7 +618,7 @@ wss.on('connection', (ws, req) => {
                     silenceHangoverTimer = null;
                     gate2Executing = false;
 
-                    const reconnectUrl = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&encoding=linear16&sample_rate=16000&channels=1';
+                    const reconnectUrl = 'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&utterance_end_ms=1800&vad_events=true&encoding=linear16&sample_rate=16000&channels=1';
                     deepgramLive = new WebSocketClient(reconnectUrl, {
                         headers: { 'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}` }
                     });
