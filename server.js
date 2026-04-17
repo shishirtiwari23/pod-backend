@@ -32,9 +32,9 @@ const groq = new OpenAI({
 });
 
 const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = geminiClient.getGenerativeModel({ model: 'gemini-2.0-flash' });
+const geminiModel = geminiClient.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-console.log(`🤖 LLM Provider: ${LLM_PROVIDER.toUpperCase()} | ${LLM_PROVIDER === 'gemini' ? 'gemini-2.0-flash' : 'llama-3.1-8b-instant'}`);
+console.log(`🤖 LLM Provider: ${LLM_PROVIDER.toUpperCase()} | ${LLM_PROVIDER === 'gemini' ? 'gemini-2.5-flash' : 'llama-3.1-8b-instant'}`);
 
 // Unified LLM streaming function — returns an async iterable of token strings.
 // Callers just do: for await (const token of streamLLM(history)) { ... }
@@ -51,9 +51,18 @@ async function* streamLLM(messages) {
         }));
 
         const userMessage = turns[turns.length - 1]?.content || '';
+        
+        let systemInstruction;
+        if (systemMsg?.content) {
+            systemInstruction = {
+                role: "system",
+                parts: [{ text: systemMsg.content }]
+            };
+        }
+
         const chat = geminiModel.startChat({
             history,
-            systemInstruction: systemMsg?.content,
+            systemInstruction,
         });
 
         const result = await chat.sendMessageStream(userMessage);
@@ -92,6 +101,16 @@ wss.on('connection', (ws, req) => {
     let chatHistory = [{ role: "system", content: SYSTEM_PROMPT }];
     let utteranceTimer = null; 
     let hardwareSleepTimer = null; 
+
+    // Production Keep-Alive: Ping client every 30s so Render/Netlify doesn't drop the connection
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+    
+    const pingInterval = setInterval(() => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    }, 30000);
 
     // utterance_end_ms: Deepgram's own VAD fires UtteranceEnd after 1800ms of genuine audio silence.
     // This is the PRIMARY Gate 2 trigger — replaces our hacky 'time since last isFinal' timers.
@@ -654,6 +673,7 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         console.log('❌ [WebSocket] Client disconnected');
+        clearInterval(pingInterval);
         if (deepgramLive) deepgramLive.terminate();
     });
 });
